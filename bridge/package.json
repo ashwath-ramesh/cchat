@@ -1,0 +1,15 @@
+{
+  "name": "cchat-bridge",
+  "version": "1.0.0",
+  "description": "WebSocket to TCP bridge for cchat server",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "keywords": ["websocket", "tcp", "bridge", "chat"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

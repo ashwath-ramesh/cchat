@@ -1,0 +1,49 @@
+<!doctype html>
+<meta charset="utf-8">
+<div id="controls">
+  <textarea id="text" disabled rows="3" cols="50"></textarea>
+  <button id="send" disabled>Send</button>
+</div>
+<pre id="log"></pre>
+<script>
+  const log = document.getElementById('log');
+  const text = document.getElementById('text');
+  const send = document.getElementById('send');
+  const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host || 'localhost:8080'}/ws`;
+  const socket = new WebSocket(url);
+
+  const write = (message) => {
+    const existing = log.textContent;
+    log.textContent = existing ? `${message}\n${existing}` : `${message}\n`;
+    log.scrollTop = 0;
+  };
+
+  const transmit = () => {
+    if (socket.readyState === WebSocket.OPEN && text.value.trim()) {
+      socket.send(text.value);
+      text.value = '';
+    }
+  };
+
+  socket.onopen = () => {
+    text.disabled = false;
+    send.disabled = false;
+    text.focus();
+  };
+
+  socket.onmessage = (event) => write(event.data);
+
+  socket.onclose = () => {
+    text.disabled = true;
+    send.disabled = true;
+    write('[disconnected]');
+  };
+
+  send.onclick = transmit;
+  text.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      transmit();
+    }
+  });
+</script>

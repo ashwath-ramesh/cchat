@@ -1,0 +1,51 @@
+# ─── Compiled Binaries ──────────────────────────────────────────────────────
+cchat-server
+cchat-server-debug
+*.o
+*.out
+*.exe
+
+# ─── Debug Files ────────────────────────────────────────────────────────────
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# ─── Editor & IDE ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ─── Node.js (bridge/) ──────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# ─── Logs ───────────────────────────────────────────────────────────────────
+*.log
+
+# ─── OS Generated ───────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ─── Build Artifacts ────────────────────────────────────────────────────────
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# ─── Backup Files ───────────────────────────────────────────────────────────
+*.bak
+*.backup
+*~
