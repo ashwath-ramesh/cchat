@@ -1,3 +1,10 @@
+// program: cchat/server/server.c
+// TODO:
+// [] dynamic arrays sizing
+// [x] hash table for storing fd info (index in array, nicknames, etc)
+// [] get nicknames when client joins
+// [] ring buffer for per client send queue (backpressure handling)
+// [] testing multiple clients connecting and sending messages
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -11,264 +18,312 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "uthash.h"
 #include "utils.h"
 
 #define HOSTNAME "localhost"
 #define PORT "3490"
-#define BACKLOG 10
-#define MAXDATASIZE 256  // max number of bytes we
-#define MAXFDS 6         // 1 listener, n clients
+#define MAXDATASIZE 256 // max number of bytes
+#define MAXFDS 6        // 1 listener, n clients
 
-int get_listener_socket(void) {
-  struct addrinfo* servinfo;
-  struct addrinfo* p_ai = NULL;
-  int fd = -1;
-  int bs;
+struct fdmap {
+  int fd;        // key
+  int idx;       // indx in array of fd's
+  char nick[11]; // chat nickname
+  UT_hash_handle hh;
+};
 
-  // resolve server address
-  int gai_status = resolve_server_addrinfo(HOSTNAME, PORT, &servinfo);
-  if (gai_status != 0) {
-    fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(gai_status));
-    freeaddrinfo(servinfo);
+/** add fd to poll array & hash map
+ * @param fds poll fd array
+ * @param usrs fd->user hash map
+ * @param addfd fd to add
+ * @param islfd true=listener, false=client
+ * @param nfd fd count (incremented)
+ * @return 0 ok, -1 fail */
+int fdadd(struct pollfd **fds, struct fdmap **usrs, int addfd, bool islfd,
+          int *nfd) {
+  struct fdmap *s;
+  s = malloc(sizeof(*s));
+  if (!s)
     return -1;
-  }
 
-  // setup the socket
-  // loop through results, and connect to the first we can
-  p_ai = NULL;
-  for (p_ai = servinfo; p_ai != NULL; p_ai = p_ai->ai_next) {
-    // create the socket
-    if ((fd = socket(p_ai->ai_family, p_ai->ai_socktype, p_ai->ai_protocol)) ==
-        -1) {
-      fprintf(stderr, "server: socket %s\n", strerror(errno));
-      continue;  // try the next address
-    }
+  if (islfd == true) {
+    // add server to fdmap
+    s->fd = addfd;
+    s->idx = 0;
+    strcpy(s->nick, "srvr");
+    HASH_ADD_INT(*usrs, fd, s);
 
-    // bind to a socket
-    if ((bs = bind(fd, p_ai->ai_addr, p_ai->ai_addrlen)) == -1) {
-      fprintf(stderr, "server: bind %s\n", strerror(errno));
-      close(fd);
-      continue;  // try next address
-    }
-    break;
-  }
-
-  // check if any connections exist
-  if (p_ai == NULL) {
-    fprintf(stderr, "server: failed to connect\n");
-    freeaddrinfo(servinfo);
-    return -1;
-  }
-
-  printf("Connection established: ");
-  print_addrinfo(p_ai);
-
-  // set as passive listener for incoming connections
-  if (listen(fd, BACKLOG) == -1) {
-    fprintf(stderr, "server: listen %s\n", strerror(errno));
-    freeaddrinfo(servinfo);
-    return -1;
-  }
-
-  // set as non-blocking
-  fcntl(fd, F_SETFL, O_NONBLOCK);
-
-  printf("server: waiting for connections...\n");
-  freeaddrinfo(servinfo);
-  return fd;
-}
-
-int add_to_pfds(struct pollfd** pfds, int add_fd, bool is_fd_listener,
-                int* fd_count) {
-  if (is_fd_listener == true) {
     // add server fd to array
-    (*pfds)[0].fd = add_fd;
-    (*pfds)[0].events = POLLIN | POLLERR;
-    (*pfds)[0].revents = 0;
+    (*fds)[0].fd = addfd;
+    (*fds)[0].events = POLLIN | POLLERR;
+    (*fds)[0].revents = 0;
   } else {
-    (*pfds)[*fd_count].fd = add_fd;
-    (*pfds)[*fd_count].events = POLLIN | POLLHUP | POLLERR;
-    (*pfds)[*fd_count].revents = 0;
+    // add client to fdmap
+    s->fd = addfd;
+    s->idx = *nfd;
+    strcpy(s->nick, "guest");
+    HASH_ADD_INT(*usrs, fd, s);
+
+    // add client to fd array
+    (*fds)[*nfd].fd = addfd;
+    (*fds)[*nfd].events = POLLIN | POLLHUP | POLLERR;
+    (*fds)[*nfd].revents = 0;
   }
 
-  (*fd_count)++;
+  (*nfd)++;
   return 0;
 }
 
-int remove_from_pfds(struct pollfd** pfds, int remove_fd, int* fd_count) {
-  // do something
-
-  if ((*pfds)[0].fd == remove_fd) {
-    // do nothing ???
+/** remove fd from poll array & hash map (swap-with-last O(1))
+ * @param fds poll fd array
+ * @param usrs fd->user hash map
+ * @param rmfd fd to remove
+ * @param nfd fd count (decremented)
+ * @return 0 ok, -1 fail/not found */
+int fdrm(struct pollfd **fds, struct fdmap **usrs, int rmfd, int *nfd) {
+  if ((*fds)[0].fd == rmfd) {
+    // if the fd to remove is the listener fd, do nothing
+    // and exit
     return -1;
-  } else {
-    for (int i = 1; i < *fd_count; i++) {
-      if ((*pfds)[i].fd == remove_fd) {
-        for (int j = i; j < *fd_count - 1; j++) {
-          (*pfds)[j] = (*pfds)[j + 1];
-        }
-        (*fd_count)--;
-        break;
-      }
+  }
+
+  // removal tasks -
+  // (a) find fd in index
+  // (b) remove fd using either: (i) compact-shift array O(n) (ii)
+  // swap-with-last removal O(1) (c) update fdmap usr with latest index for fd's
+
+  // compact-shift array
+  // for (int i = 1; i < *fdcnt; i++) {
+  //   if ((*fds)[i].fd == rmfd) {
+  //     for (int j = i; j < *fdcnt - 1; j++) {
+  //       (*fds)[j] = (*fds)[j + 1];
+  //     }
+  //     (*fdcnt)--;
+  //     break;
+  //   }
+  // }
+
+  // lookup index from fdmap usr
+  struct fdmap *srem, *slast;
+  HASH_FIND_INT(*usrs, &rmfd, srem);
+  if (!srem)
+    return -1;
+  HASH_FIND_INT(*usrs, &(*fds)[*nfd - 1].fd, slast);
+  // do swap-with-last O(1) removal
+  (*fds)[srem->idx] = (*fds)[*nfd - 1];
+  // update fdmap usr with new index of ex-last element
+  if (srem != slast)
+    slast->idx = srem->idx;
+
+  HASH_DEL(*usrs, srem);
+  free(srem);
+  (*nfd)--;
+
+  return 0;
+}
+
+/** format msg with sender fd prefix
+ * @param sfd sender fd
+ * @param msg raw message
+ * @return malloc'd "fd: msg" string or NULL */
+static char *fmtmsg(int sfd, const char *msg) {
+  int need = snprintf(NULL, 0, "%d: %s", sfd, msg);
+  if (need < 0)
+    return NULL;
+
+  char *out = malloc(need + 1);
+  if (!out)
+    return NULL;
+
+  if (snprintf(out, need + 1, "%d: %s", sfd, msg) < 0) {
+    free(out);
+    return NULL;
+  }
+
+  return out;
+}
+
+/** broadcast msg to all clients except sender
+ * @param nfd fd count
+ * @param fds poll fd array
+ * @param msg message to send
+ * @param sfd sender fd (skipped)
+ * @return 0 ok, -1 fail */
+int bcast(int nfd, struct pollfd **fds, const char *msg, int sfd) {
+  char *buf = fmtmsg(sfd, msg);
+  if (!buf)
+    return -1;
+
+  int mlen = strlen(buf); // message len
+
+  // build target list once (excl. listener & sender fd)
+  // Sized for all clients (sender excluded in loop: -1 if listener, -2 if
+  // client). Worst case -1.
+  int tgtfds[MAXFDS - 1];
+  int tgtidx = 0;
+  for (int i = 1; i < nfd; i++) { // start at 1 to excl lfd
+    if ((*fds)[i].fd != sfd) {    // skip sender fd
+      tgtfds[tgtidx] = (*fds)[i].fd;
+      tgtidx++;
     }
   }
 
-  //
-  return 0;
-}
+  // batch send to all targets
+  for (int i = 0; i < tgtidx; i++) {
+    int nsent = 0;
 
-int broadcast_to_clients(int fd_count, struct pollfd** pfds, const char* msg,
-                         int sender_fd) {
-  char msg_w_sender[512];
-  snprintf(msg_w_sender, sizeof(msg_w_sender), "from: %d msg: %s\n", sender_fd,
-           msg);
-  int msglen = strlen(msg_w_sender);
+    while (nsent < mlen) {
+      int n = send(tgtfds[i], buf + nsent, mlen - nsent, 0);
 
-  for (int i = 1; i < fd_count; i++) {
-    int sendto_fd = (*pfds)[i].fd;
-
-    if (sendto_fd != sender_fd) {
-      int total_sent = 0;
-
-      while (total_sent < msglen) {
-        int n =
-            send(sendto_fd, msg_w_sender + total_sent, msglen - total_sent, 0);
-
-        if (n == -1) {
-          if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            // Buffer full, retry (could add a small delay or use poll)
-            continue;
-          }
-          // Permanent error (EPIPE, ECONNRESET, etc.)
-          fprintf(stderr, "broadcast send to fd %d: %s\n", sendto_fd,
-                  strerror(errno));
-          break;  // Give up on this client, move to next
+      if (n == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          // Buffer full, retry (could add a small delay or use poll)
+          continue;
         }
-
-        total_sent += n;
+        // Permanent error (EPIPE, ECONNRESET, etc.)
+        fprintf(stderr, "bcast err | fd %d: %s\n", tgtfds[i], strerror(errno));
+        break; // Give up on this client, move to next
       }
+      nsent += n;
     }
   }
+
+  free(buf);
   return 0;
 }
 
-int get_ntop_ip(struct sockaddr_storage remote_addr,
-                char p_ip[INET6_ADDRSTRLEN]) {
-  void* addr = NULL;
+/** extract IP string from sockaddr (v4/v6)
+ * @param raddr client socket address
+ * @param ipstr output buffer [INET6_ADDRSTRLEN]
+ * @return 0 ok, -1 unknown family */
+int ipstr(struct sockaddr_storage raddr, char ipstr[INET6_ADDRSTRLEN]) {
+  void *addr = NULL;
 
-  switch (remote_addr.ss_family) {
-    case AF_INET:
-      addr = &(((struct sockaddr_in*)&remote_addr)->sin_addr);
-      break;
-    case AF_INET6:
-      addr = &(((struct sockaddr_in6*)&remote_addr)->sin6_addr);
-      break;
-    default:
-      fprintf(stderr, "get_p_ip: unknown address family %d\n",
-              remote_addr.ss_family);
-      return -1;
+  switch (raddr.ss_family) {
+  case AF_INET:
+    addr = &(((struct sockaddr_in *)&raddr)->sin_addr);
+    break;
+  case AF_INET6:
+    addr = &(((struct sockaddr_in6 *)&raddr)->sin6_addr);
+    break;
+  default:
+    fprintf(stderr, "ipstr: unknown address family %d\n", raddr.ss_family);
+    return -1;
   }
-  inet_ntop(remote_addr.ss_family, addr, p_ip, INET6_ADDRSTRLEN);
+  inet_ntop(raddr.ss_family, addr, ipstr, INET6_ADDRSTRLEN);
 
   return 0;
 }
 
-int process_new_connection(int listener_fd, int* fd_count,
-                           struct pollfd** pfds) {
-  struct sockaddr_storage remote_client_addr;
-  socklen_t new_client_addr_len;
-  int new_client_fd;
+/** handle new client connection (accept, add to poll, broadcast join)
+ * @param lsock listener socket
+ * @param nfd fd count
+ * @param fds poll fd array
+ * @param usrs fd->user hash map
+ * @return 0 ok, -1 fail/capacity */
+int newcon(int lsock, int *nfd, struct pollfd **fds, struct fdmap **usrs) {
+  struct sockaddr_storage caddr; // new remote client address
+  socklen_t caddrlen;            // new client address len
+  int cfd;                       // new client fd
 
   // Accept new connection on listener fd with error checking
-  new_client_addr_len = sizeof(remote_client_addr);
-  new_client_fd = accept(listener_fd, (struct sockaddr*)&remote_client_addr,
-                         &new_client_addr_len);
-  if (new_client_fd == -1) {
+  caddrlen = sizeof(caddr);
+  cfd = accept(lsock, (struct sockaddr *)&caddr, &caddrlen);
+  if (cfd == -1) {
     fprintf(stderr, "accept: %s\n", strerror(errno));
     return -1;
   }
 
   // set as non-blocking
-  fcntl(new_client_fd, F_SETFL, O_NONBLOCK);
+  fcntl(cfd, F_SETFL, O_NONBLOCK);
 
   // Validate if pfds array has space. If not,
   // reject new client with a msg
-  if (*fd_count >= MAXFDS) {
+  if (*nfd >= MAXFDS) {
     char msg[] = "server at capacity. please try again later.\n";
-    send(new_client_fd, msg, strlen(msg), 0);
+    send(cfd, msg, strlen(msg), 0);
     // printf("%s", msg);
-    close(new_client_fd);
+    close(cfd);
     return -1;
   }
 
   // Add new client fd to the pfds array
-  add_to_pfds(pfds, new_client_fd, false, fd_count);
+  fdadd(fds, usrs, cfd, false, nfd);
 
   // broadcast new client info to chat group
-  char client_ip[INET6_ADDRSTRLEN];
-  if (get_ntop_ip(remote_client_addr, client_ip) == -1) {
-    fprintf(stderr, "get_ntop_ip failed for client fd: %d\n", new_client_fd);
-    strcpy(client_ip, "unknown");
+  char cip[INET6_ADDRSTRLEN]; // client ip
+  if (ipstr(caddr, cip) == -1) {
+    fprintf(stderr, "ipstr failed for client: %d\n", cfd);
+    strcpy(cip, "unknown");
   }
 
-  char announcement[256];  // Buffer to hold the message
-  snprintf(announcement, sizeof(announcement),
-           "new client connecting from %s\n", client_ip);
-  printf("%s", announcement);
-  broadcast_to_clients(*fd_count, pfds, announcement, new_client_fd);
+  char msg[256]; // Buffer to hold the message
+  snprintf(msg, sizeof(msg), "new client connecting from %s\n", cip);
+  printf("%s", msg);
+  bcast(*nfd, fds, msg, cfd);
 
   return 0;
 }
 
-int process_existing_connection(int sender_fd, int* fd_count,
-                                struct pollfd** pfds) {
-  // char Bbuffer to recv data
-  char buf[MAXDATASIZE];
-  int nbytes = recv(sender_fd, buf, MAXDATASIZE, 0);
-  switch (nbytes) {
-    case 0: {
-      // client disconnected early. handle!
-      // handles POLLHUP || POLLERR
-      char announcement[256];  // Buffer to hold the message
-      snprintf(announcement, sizeof(announcement),
-               "client %d has left the chat!\n", sender_fd);
-      printf("%s", announcement);
-      broadcast_to_clients(*fd_count, pfds, announcement, 0);
-      remove_from_pfds(pfds, sender_fd, fd_count);
-      close(sender_fd);
-      return -1;
-    }
-    case -1: {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        // not a real error for non-blocking sockets
-        return 0;
-      }
-      fprintf(stderr, "process_existing_connection: %s\n", strerror(errno));
-      remove_from_pfds(pfds, sender_fd, fd_count);
-      close(sender_fd);
-      return -1;
-    }
-    default: {
-      buf[nbytes] = '\0';  // Null-terminate the received data
-      broadcast_to_clients(*fd_count, pfds, buf, sender_fd);
+/** handle existing client I/O (recv msg, broadcast, or handle disconnect)
+ * @param sfd client socket fd
+ * @param nfd fd count
+ * @param pfds poll fd array
+ * @param usrs fd->user hash map
+ * @return 0 ok, -1 disconnect/error */
+int extcon(int sfd, int *nfd, struct pollfd **pfds, struct fdmap **usrs) {
+  char buf[MAXDATASIZE]; // buffer to recv data
+  int n = recv(sfd, buf, MAXDATASIZE, 0);
+  switch (n) {
+  case 0: {
+    // client disconnected early. handle!
+    // handles POLLHUP || POLLERR
+    char msg[256]; // Buffer to hold the message
+    snprintf(msg, sizeof(msg), "client %d has left the chat!\n", sfd);
+    printf("%s", msg);
+    bcast(*nfd, pfds, msg, 0);
+    fdrm(pfds, usrs, sfd, nfd);
+    close(sfd);
+    return -1;
+  }
+  case -1: {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      // not a real error for non-blocking sockets
       return 0;
     }
+    fprintf(stderr, "extcon: %s\n", strerror(errno));
+    fdrm(pfds, usrs, sfd, nfd);
+    close(sfd);
+    return -1;
+  }
+  default: {
+    buf[n] = '\0'; // Null-terminate the received data
+    bcast(*nfd, pfds, buf, sfd);
+    return 0;
+  }
   }
 }
 
-int process_connections(int listener_fd, int* fd_count, struct pollfd** pfds) {
+/** process poll events (new connections + client I/O)
+ * @param lfd listener fd
+ * @param nfd fd count
+ * @param pfds poll fd array
+ * @param usrs fd->user hash map
+ * @return 0 ok */
+int proc(int lfd, int *nfd, struct pollfd **pfds, struct fdmap **usrs) {
   // >>> 1. process a new client connection
   if ((*pfds)[0].revents & POLLIN) {
-    if (process_new_connection(listener_fd, fd_count, pfds) != 0) {
-      fprintf(stderr, "process_new_connection: %s\n", strerror(errno));
+    if (newcon(lfd, nfd, pfds, usrs) != 0) {
+      fprintf(stderr, "newcon: %s\n", strerror(errno));
     }
   }
 
   // >>> 2. process existing connections
-  for (int i = 1; i < *fd_count; i++) {
+  for (int i = 1; i < *nfd; i++) {
     if ((*pfds)[i].revents & POLLIN) {
-      if (process_existing_connection((*pfds)[i].fd, fd_count, pfds) == -1) {
-        i--;  // client removed. adjust index to check this position.
+      if (extcon((*pfds)[i].fd, nfd, pfds, usrs) == -1) {
+        i--; // client removed. adjust index to check this position.
       }
     }
   }
@@ -277,33 +332,42 @@ int process_connections(int listener_fd, int* fd_count, struct pollfd** pfds) {
 }
 
 int main() {
-  int return_status = 0;
+  int rstat = 0;
 
-  int sockfd = -1;
+  int lsock = -1;
+
   // setup array of fd's for poll() and add server to it
-  int fd_size = MAXFDS;  // 1 listener, 5 clients
-  int fd_count = 0;
-  struct pollfd* pfds = malloc(sizeof(*pfds) * fd_size);
+  int sz = MAXFDS; // 1 listener, 5 clients
+  int cnt = 0;     // current count
+  struct pollfd *fds = malloc(sizeof(*fds) * sz);
+  if (!fds)
+    return -1;
 
-  sockfd = get_listener_socket();
-  add_to_pfds(&pfds, sockfd, true, &fd_count);
+  struct fdmap *users = NULL;
+
+  if (lstnfd(HOSTNAME, PORT, true, &lsock) == -1) {
+    fprintf(stderr, "lstnfd: %s\n", strerror(errno));
+    return -1;
+  }
+  fdadd(&fds, &users, lsock, true, &cnt);
 
   while (1) {
-    int poll_count = poll(pfds, fd_count, -1);
-
-    if (poll_count == -1) {
+    if (poll(fds, cnt, -1) == -1) // fd's ready for IO
+    {
       fprintf(stderr, "poll: %s\n", strerror(errno));
       exit(1);
     }
 
-    process_connections(sockfd, &fd_count, &pfds);
+    proc(lsock, &cnt, &fds, &users);
   }
 
-  // cleanup:
-  if (pfds) free(pfds);
+  // cleanup
+  if (fds)
+    free(fds);
 
   printf("\nClosing connection.\n");
-  if (sockfd) close(sockfd);
+  if (lsock)
+    close(lsock);
 
-  return return_status;
+  return rstat;
 }

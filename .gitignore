@@ -1,6 +1,7 @@
 # ─── Compiled Binaries ──────────────────────────────────────────────────────
 cchat-server
 cchat-server-debug
+cchat-ws
 *.o
 *.out
 *.exe
