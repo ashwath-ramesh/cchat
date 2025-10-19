@@ -11,7 +11,7 @@ Minimal chat server built in C using poll() for I/O multiplexing, with WebSocket
 - [x] Partial send() handling with retry logic
 - [x] Broadcast messaging to all connected clients
 - [x] Connection/disconnection announcements
-- [ ] Message timestamps
+- [x] Message timestamps
 - [ ] Heartbeat: Online/last-seen per user
 - [x] Message length caps
 - [x] Back-pressure handling for slow client-handling
